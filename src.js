@@ -611,40 +611,49 @@ async function getMeshCsrfToken(url, cookie) {
     return token;
 }
 
-async function uploadMesh(filePath, cookie, creatorID, isGroup) {
-    const baseUrl = "https://data.roblox.com/ide/publish/UploadNewMesh";
-    const url = new URL(baseUrl);
-    url.searchParams.set("name", "RenderMesh");
-    url.searchParams.set("description", "RenderMesh");
-    url.searchParams.set("isPublic", "False");
-    url.searchParams.set("genreTypeId", "1");
-    url.searchParams.set("allowComments", "False");
-    if (isGroup) {
-        url.searchParams.set("groupId", creatorID);
-    }
-    
-    const meshCsrfToken = await getMeshCsrfToken(url.toString(), cookie);
+async function uploadMesh(filePath, creatorID, isGroup, apiKey, oldAssetId) {
+    const creationContext = isGroup
+        ? { creator: { groupId: parseInt(creatorID, 10) } }
+        : { creator: { userId: parseInt(creatorID, 10) } };
 
-    const fileStream = fs.createReadStream(filePath);
-    const resp = await fetch(url.toString(), {
+    const form = new FormData();
+    form.append("request", JSON.stringify({
+        assetType: "Mesh",
+        displayName: path.basename(filePath),
+        description: `Reuploaded from rbxassetid://${oldAssetId}`,
+        creationContext
+    }));
+
+    form.append("fileContent", fs.createReadStream(filePath), {
+        contentType: "application/octet-stream"
+    });
+
+    const response = await fetch("https://apis.roblox.com/assets/v1/assets", {
         method: "POST",
         headers: {
-            "Cookie": cookie,
-            "User-Agent": "RobloxStudio/WinInet",
-            "x-csrf-token": meshCsrfToken
+            "x-api-key": apiKey
         },
-        body: fileStream
+        body: form
     });
-    if (!resp.ok) {
-        const errorText = await resp.text();
-        throw new Error(`Mesh upload failed (status ${resp.status}): ${errorText}`);
+
+    if (response.status === 201) {
+        const data = await response.json();
+        if (!data.assetId) {
+            throw new Error(`Missing assetId in response: ${JSON.stringify(data)}`);
+        }
+        return data.assetId;
     }
-    const text = (await resp.text()).trim();
-    const assetId = parseInt(text, 10);
-    if (isNaN(assetId)) {
-        throw new Error(`Mesh upload returned invalid assetId: ${text}`);
+
+    if (response.status === 200) {
+        const opData = await response.json();
+        if (!opData.operationId) {
+            throw new Error(`Missing operationId: ${JSON.stringify(opData)}`);
+        }
+        return await pollOperationUntilDone(opData.operationId, apiKey);
     }
-    return assetId;
+
+    const errorText = await response.text().catch(() => "");
+    throw new Error(`Mesh upload failed (status ${response.status}): ${errorText}`);
 }
 
 async function runJobMeshes(jobId, assetIDs, creatorID, isGroup, apiKey) {
@@ -703,10 +712,6 @@ async function runJobMeshes(jobId, assetIDs, creatorID, isGroup, apiKey) {
         const totalToUpload = downloaded.length;
         let uploadedCount = 0;
         jobInfo.message = "Starting mesh uploads...";
-
-        let cookie = getCookieFromRustCLI();
-        if (!cookie) {
-            throw new Error("Mesh upload: .ROBLOSECURITY cookie not found.");
         }
 
         for (let i = 0; i < downloaded.length; i += 60) {
@@ -717,7 +722,7 @@ async function runJobMeshes(jobId, assetIDs, creatorID, isGroup, apiKey) {
                 uploadedCount++;
                 try {
                     jobInfo.message = `${uploadedCount}/${totalToUpload} uploading mesh...`;
-                    const newAssetId = await uploadMesh(item.filePath, cookie, creatorID, isGroup);
+                    const newAssetId = await uploadMesh(item.filePath, creatorID, isGroup, apiKey, item.oldId);
                     newlyCreated.push({
                         oldId: item.oldId,
                         newId: newAssetId
